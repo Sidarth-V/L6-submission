@@ -1,9 +1,10 @@
 from pydoc import Helper
+
 from django.contrib.auth.mixins import LoginRequiredMixin
-from django.views.generic.edit import CreateView
+from django.db import transaction
 from django.forms import ModelForm
-from django.forms import ModelForm, ValidationError
 from django.http import HttpResponseRedirect
+from django.views.generic.edit import CreateView
 from tasks.models import Task
 
 
@@ -15,7 +16,7 @@ class TaskCreateForm(LoginRequiredMixin, ModelForm):
     class Meta:
         model = Task
         fields = ["title", "description", "priority", "completed"]
-    
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields.get("title").widget.attrs[
@@ -40,18 +41,38 @@ class GenericTaskCreateView(LoginRequiredMixin, CreateView):
     def form_valid(self, form):
         self.object = form.save()
         self.object.user = self.request.user
-        self.helper(int(form.cleaned_data.get("priority")))
+        helper(self.request.user, int(form.cleaned_data.get("priority")), form)
         self.object.save()
         return HttpResponseRedirect(self.get_success_url())
 
-    def helper(self, priority):
-        if Task.objects.filter(
-            deleted=False, user=self.request.user, priority=priority
-        ).exists():
-            old_task = Task.objects.filter(
-                deleted=False, user=self.request.user, priority=priority
+
+def helper(user, priority, form):
+    if Task.objects.filter(
+        deleted=False, user=user, priority=priority, completed=False
+    ).exists():
+        old_tasks = (
+            Task.objects.filter(
+                deleted=False,
+                user=user,
+                priority__gte=priority,
+                completed=False,
             )
-            self.helper(priority + 1)
-            priority = priority + 1
-            old_task.update(priority=priority)
-            return
+            .exclude(pk=form.instance.id)
+            .order_by("priority")
+            .select_for_update()
+        )
+
+        changes = []
+        flag = priority
+        for task in old_tasks:
+            if flag != task.priority:
+                break
+            task.priority = task.priority + 1
+            flag = flag + 1
+            changes.append(task)
+
+        with transaction.atomic():
+            if changes:
+                Task.objects.bulk_update(changes, ["priority"], batch_size=100)
+
+        return
